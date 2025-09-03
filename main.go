@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -85,8 +86,9 @@ var enginePool *EnginePool
 type MoveRequest struct {
 	UserMove   string `json:"user_move" binding:"required"`
 	CurrentFEN string `json:"current_fen" binding:"required"`
-	Depth      int    `json:"depth"`     // Optional: Search depth
-	MoveTime   int    `json:"move_time"` // Optional: Thinking time in milliseconds
+	Depth      int    `json:"depth"`
+	MoveTime   int    `json:"move_time"`
+	SkillLevel int    `json:"skill_level"` // <-- CHANGE: from Elo to SkillLevel
 }
 
 // MoveResponse defines the structure of the JSON response.
@@ -168,35 +170,29 @@ func moveHandler(c *gin.Context) {
 	}
 	game := chess.NewGame(fen)
 
-	// --- 1. Process User's Move (THE FIX IS HERE) ---
-	// Instead of game.MoveStr, we manually find the move from the valid moves list.
-	// This correctly handles UCI notation like "e2e4".
 	userMove, err := findMoveByUCI(game, req.UserMove)
 	if err != nil {
 		log.Printf("User made an illegal move: %s", req.UserMove)
 		c.JSON(http.StatusOK, MoveResponse{
 			UserMoveStatus: "illegal-move",
 			NewFEN:         req.CurrentFEN,
-			GameOutcome:    game.Outcome().String(), // Will be "*" for ongoing game
+			GameOutcome:    game.Outcome().String(),
 		})
 		return
 	}
 
-	// Apply the validated move object.
 	if err := game.Move(userMove); err != nil {
-		// This should not happen if findMoveByUCI works correctly, but it's good practice to check.
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to apply a valid move: " + err.Error()})
 		return
 	}
 
-	// --- 2. Analyze the game state AFTER the user's move ---
 	userMoveStatus := getMoveStatus(game, userMove)
 	log.Printf("User move '%s' was legal. Status: %s", req.UserMove, userMoveStatus)
 
 	if game.Outcome() != chess.NoOutcome {
 		log.Printf("Game over after user move. Outcome: %s", game.Outcome())
 		c.JSON(http.StatusOK, MoveResponse{
-			UserMoveStatus: userMoveStatus, // Status could be "check-mate"
+			UserMoveStatus: userMoveStatus,
 			EngineMove:     "",
 			NewFEN:         game.Position().String(),
 			GameOutcome:    game.Outcome().String(),
@@ -204,9 +200,24 @@ func moveHandler(c *gin.Context) {
 		return
 	}
 
-	// --- 3. Get Engine's Move (this part is already correct) ---
 	engine := enginePool.Get()
 	defer enginePool.Put(engine)
+
+	// --- UPDATED LOGIC FOR SKILL LEVEL CONTROL ---
+	// Skill Level is an integer from 0 (weakest) to 20 (strongest).
+	// We'll validate the input and default to 20 (max strength) if out of range.
+	skill := req.SkillLevel
+	if skill < 0 || skill > 20 {
+		skill = 20
+	}
+	log.Printf("Setting engine Skill Level to %d", skill)
+
+	setSkillCmd := uci.CmdSetOption{Name: "Skill Level", Value: strconv.Itoa(skill)}
+	if err := engine.Run(setSkillCmd); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set engine skill level: " + err.Error()})
+		return
+	}
+	// --- END OF UPDATED LOGIC ---
 
 	cmdPos := uci.CmdPosition{Position: game.Position()}
 	cmdGo := uci.CmdGo{Depth: req.Depth, MoveTime: time.Duration(req.MoveTime) * time.Millisecond}
@@ -229,7 +240,6 @@ func moveHandler(c *gin.Context) {
 		return
 	}
 
-	// --- 4. Analyze and Respond ---
 	engineMoveStatus := getMoveStatus(game, bestMove)
 	engineMoveStr := bestMove.String()
 	log.Printf("Engine move '%s'. Status: %s", engineMoveStr, engineMoveStatus)
