@@ -1,0 +1,44 @@
+name: Stockfish Integrator APP
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up SSH access
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Ensure target directory exists on server
+        run: |
+          ssh -T -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} "mkdir -p /home/${{ secrets.SSH_USER }}/stockfish_integrator/app"
+
+      - name: Synchronize files to server with rsync
+        run: |
+          rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" --exclude '.git' ./ ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }}:/home/${{ secrets.SSH_USER }}/stockfish_integrator/app/
+
+      - name: Verify Docker Compose is installed
+        run: |
+          ssh -T -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} "docker compose version || { echo 'Docker Compose is not installed'; exit 1; }"
+
+      - name: Deploy with Docker Compose
+        run: |
+          ssh -T -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            set -e
+            echo "Changing directory to logging service..."
+            cd /home/${{ secrets.SSH_USER }}/stockfish_integrator/app
+            echo "Running docker compose down..."
+            docker compose down
+            echo "Running docker compose up -d --build..."
+            COMPOSE_BAKE=true docker compose up -d --build
+            echo "Deployment completed successfully!"
+          EOF
