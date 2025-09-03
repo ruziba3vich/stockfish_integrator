@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/notnil/chess"
 	"github.com/notnil/chess/uci"
@@ -113,6 +114,8 @@ func main() {
 
 	// gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
+
+	router.Use(cors.Default())
 
 	router.POST("/move", moveHandler)
 
