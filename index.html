@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Bot UI</title>
+    <style>
+        body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; flex-wrap: wrap; padding: 20px; background-color: #f0f0f0; min-height: 100vh; margin: 0; }
+        .container { display: flex; flex-direction: column; align-items: center; text-align: center; }
+        .chessboard { width: 400px; height: 400px; border: 2px solid #333; display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr); margin-bottom: 20px; }
+        .square { display: flex; justify-content: center; align-items: center; font-size: 32px; cursor: pointer; user-select: none; }
+        .square.light { background-color: #f0d9b5; }
+        .square.dark { background-color: #b58863; }
+        .square.selected { background-color: #6a994e !important; }
+        .controls { background-color: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); width: 400px; }
+        .controls div { margin-bottom: 10px; }
+        label { font-weight: bold; margin-right: 10px; }
+        input[type="number"] { width: 60px; padding: 5px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 15px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; background-color: #007bff; color: white; transition: background-color 0.2s; }
+        button:hover { background-color: #0056b3; }
+        #status { font-size: 1.2em; font-weight: bold; color: #333; min-height: 25px; }
+        #fen { font-family: 'Courier New', Courier, monospace; font-size: 0.9em; word-break: break-all; margin-top: 10px; color: #666; }
+        .elo-control { display: flex; align-items: center; justify-content: space-between; }
+        #eloSlider { flex-grow: 1; margin: 0 10px; }
+        #eloValue { font-weight: bold; min-width: 100px; text-align: left; }
+        #apiLogContainer { border: 1px solid #ccc; margin-top: 15px; padding: 10px; text-align: left; }
+        #apiLogContainer h3 { margin: 0 0 10px 0; font-size: 1em; }
+        #apiLog { background-color: #282c34; color: #abb2bf; padding: 10px; border-radius: 5px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; white-space: pre-wrap; word-wrap: break-word; min-height: 100px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Chess Bot UI</h1>
+        <div id="chessboard" class="chessboard"></div>
+        <div class="controls">
+            <div id="status">White to move</div>
+            <div>
+                <label for="depth">Engine Depth:</label>
+                <input type="number" id="depth" value="12" min="1" max="20" title="Less important at low ELOs">
+            </div>
+            <!-- UPDATED: Slider range now starts at 400 ELO -->
+            <div class="elo-control">
+                <label for="eloSlider">ELO:</label>
+                <input type="range" id="eloSlider" min="400" max="2800" value="2800" step="50">
+                <span id="eloValue">Max Strength</span>
+            </div>
+            <div>
+                <button id="restartBtn">Restart Game</button>
+            </div>
+            <div id="fen"></div>
+            <div id="apiLogContainer">
+                <h3>API Communication Log</h3>
+                <pre id="apiLog">Waiting for first move...</pre>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+
+    <script>
+        // Self-contained chessboard UI class (no changes needed here)
+        class SimpleChessBoard {
+            constructor(containerId) { this.container = document.getElementById(containerId); this.selectedSquare = null; this.pieces = { 'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙', 'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟' }; this.onMove = null; this.createBoard(); }
+            createBoard() { this.container.innerHTML = ''; for (let r = 0; r < 8; r++) { for (let c = 0; c < 8; c++) { const s = document.createElement('div'); s.className = `square ${(r + c) % 2 === 0 ? 'light' : 'dark'}`; s.dataset.square = this.getSquareName(r, c); s.addEventListener('click', e => this.handleSquareClick(e)); this.container.appendChild(s); } } }
+            getSquareName(r, c) { return String.fromCharCode(97 + c) + (8 - r); }
+            getSquareElement(s) { return this.container.querySelector(`[data-square="${s}"]`); }
+            handleSquareClick(e) { const t = e.currentTarget, s = t.dataset.square; if (this.selectedSquare) { if (this.selectedSquare === s) { this.clearHighlights(); this.selectedSquare = null; } else { if (this.onMove) { const r = this.onMove(this.selectedSquare, s); if (r) { this.clearHighlights(); this.selectedSquare = null; } else { this.clearHighlights(); if (t.textContent.trim()) { this.selectedSquare = s; this.getSquareElement(s).classList.add('selected'); } else { this.selectedSquare = null; } } } } } else { if (t.textContent.trim()) { this.selectedSquare = s; this.getSquareElement(s).classList.add('selected'); } } }
+            clearHighlights() { this.container.querySelectorAll('.square').forEach(s => { s.classList.remove('selected'); }); }
+            setPosition(fen) { const [p] = fen.split(' '), rs = p.split('/'); let si = 0; for (let r = 0; r < 8; r++) { let c = 0; for (const h of rs[r]) { if (h >= '1' && h <= '8') { for (let i = 0; i < parseInt(h); i++) { const s = this.container.children[si]; s.textContent = ''; si++; c++; } } else { const s = this.container.children[si]; s.textContent = this.pieces[h] || ''; si++; c++; } } } }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            if (typeof Chess === 'undefined') {
+                document.getElementById('status').textContent = 'Error: Chess.js failed to load';
+                return;
+            }
+
+            let board = new SimpleChessBoard('chessboard');
+            const game = new Chess();
+            const API_URL = "http://89.117.58.248:8080/move";
+            let currentGameId = 0;
+
+            const statusEl = document.getElementById('status');
+            const fenEl = document.getElementById('fen');
+            const depthInput = document.getElementById('depth');
+            const restartBtn = document.getElementById('restartBtn');
+            const apiLogEl = document.getElementById('apiLog');
+            const eloSlider = document.getElementById('eloSlider');
+            const eloValue = document.getElementById('eloValue');
+
+            function logApiCall(direction, statusCode, data) {
+                const logEntry = `--- ${direction} ---\nStatus: ${statusCode}\n\n${JSON.stringify(data, null, 2)}`;
+                apiLogEl.textContent = logEntry;
+            }
+            
+            function getEngineMove(fenBeforeMove) {
+                const requestGameId = currentGameId;
+                const history = game.history({ verbose: true });
+                if (history.length === 0) return;
+                
+                const lastMove = history[history.length - 1];
+                let userMoveUci = lastMove.from + lastMove.to;
+                if (lastMove.promotion) {
+                    userMoveUci += lastMove.promotion;
+                }
+
+                statusEl.textContent = 'Engine is thinking...';
+
+                const selectedElo = parseInt(eloSlider.value, 10);
+                const requestBody = {
+                    user_move: userMoveUci,
+                    current_fen: fenBeforeMove,
+                    depth: parseInt(depthInput.value, 10),
+                    move_time: 1500,
+                    elo: selectedElo // The backend will interpret this as a blunder chance
+                };
+
+                logApiCall('Request Sent', 'N/A', requestBody);
+
+                fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody)
+                })
+                .then(response => {
+                    const responseClone = response.clone();
+                    return Promise.all([response.status, responseClone.json()]);
+                })
+                .then(([status, data]) => {
+                    logApiCall('Response Received', status, data);
+                    if (requestGameId === currentGameId) {
+                        game.load(data.new_fen);
+                        board.setPosition(game.fen());
+                        updateStatus();
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching engine move:', error);
+                    logApiCall('Error', 'Network or CORS Error', { error: error.message });
+                    if (requestGameId === currentGameId) {
+                        statusEl.textContent = 'Error communicating with engine!';
+                    }
+                });
+            }
+
+            function updateStatus() {
+                let status = '';
+                const moveColor = game.turn() === 'w' ? 'White' : 'Black';
+                status = moveColor + ' to move';
+                if (game.in_checkmate()) {
+                    status = `Game over, ${moveColor} is in checkmate.`;
+                } else if (game.in_draw()) {
+                    status = 'Game over, draw.';
+                } else if (game.in_check()) {
+                    status += `, ${moveColor} is in check.`;
+                }
+                statusEl.textContent = status;
+                fenEl.textContent = game.fen();
+            }
+
+            function resetGame() {
+                currentGameId++;
+                game.reset();
+                board.setPosition(game.fen());
+                updateStatus();
+                apiLogEl.textContent = 'Game restarted. Waiting for move...';
+            }
+
+            function handleMove(from, to) {
+                if (game.turn() !== 'w') return false;
+                const fenBeforeMove = game.fen();
+                const moves = game.moves({ square: from, verbose: true });
+                let promotionPiece = 'q';
+                let isPromotion = false;
+
+                for (const m of moves) {
+                    if (m.from === from && m.to === to && m.flags.includes('p')) {
+                        isPromotion = true;
+                        break;
+                    }
+                }
+
+                if (isPromotion) {
+                    let choice = prompt("Promote to what piece? (q, r, b, n)", "q");
+                    if (choice && ['q', 'r', 'b', 'n'].includes(choice.toLowerCase())) {
+                        promotionPiece = choice.toLowerCase();
+                    } else {
+                        return false; 
+                    }
+                }
+
+                const move = game.move({ from, to, promotion: promotionPiece });
+                if (move === null) return false;
+                
+                board.setPosition(game.fen());
+                updateStatus();
+                setTimeout(() => getEngineMove(fenBeforeMove), 250);
+                return true;
+            }
+            
+            board.onMove = handleMove;
+            board.setPosition(game.fen());
+            updateStatus();
+            
+            restartBtn.addEventListener('click', resetGame);
+            
+            // UPDATED: Event listener for the new ELO slider range
+            eloSlider.addEventListener('input', function() {
+                const value = this.value;
+                if (value >= 2800) {
+                    eloValue.textContent = 'Max Strength';
+                } else {
+                    eloValue.textContent = `${value} ELO`;
+                }
+            });
+        });
+    </script>
+</body>
+</html>

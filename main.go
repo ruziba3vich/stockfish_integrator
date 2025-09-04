@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -26,21 +27,17 @@ type EnginePool struct {
 // NewEnginePool creates and initializes a new engine pool.
 func NewEnginePool(enginePath string, poolSize int) (*EnginePool, error) {
 	pool := &EnginePool{
-		// Use a buffered channel to store the available engine instances.
 		engines: make(chan *uci.Engine, poolSize),
 		path:    enginePath,
 	}
 
-	// Pre-start and initialize each engine instance.
 	for i := 0; i < poolSize; i++ {
 		engine, err := uci.New(enginePath)
 		if err != nil {
-			// If one fails, close any that were successfully created before failing.
 			pool.Close()
 			return nil, err
 		}
 
-		// Send standard UCI initialization commands.
 		if err := engine.Run(uci.CmdUCI, uci.CmdIsReady, uci.CmdUCINewGame); err != nil {
 			engine.Close()
 			pool.Close()
@@ -61,20 +58,16 @@ func (p *EnginePool) Get() *uci.Engine {
 
 // Put returns an engine to the pool so it can be reused.
 func (p *EnginePool) Put(engine *uci.Engine) {
-	// Use a select with a default case for a non-blocking put.
-	// This prevents deadlocks if an engine is put back into a full pool.
 	select {
 	case p.engines <- engine:
 	default:
-		// Should not happen with correct Get/Put usage, but as a safeguard,
-		// close the engine if the pool is unexpectedly full.
 		engine.Close()
 	}
 }
 
 // Close cleanly shuts down all engines in the pool.
 func (p *EnginePool) Close() {
-	close(p.engines) // Close the channel to signal no more engines will be added.
+	close(p.engines)
 	for engine := range p.engines {
 		engine.Close()
 	}
@@ -88,7 +81,7 @@ type MoveRequest struct {
 	CurrentFEN string `json:"current_fen" binding:"required"`
 	Depth      int    `json:"depth"`
 	MoveTime   int    `json:"move_time"`
-	SkillLevel int    `json:"skill_level"` // <-- CHANGE: from Elo to SkillLevel
+	Elo        int    `json:"elo"`
 }
 
 // MoveResponse defines the structure of the JSON response.
@@ -107,21 +100,18 @@ func main() {
 	}
 	log.Printf("Using Stockfish at: %s", stockfishPath)
 
-	// Create engine pool (can be configured via env var, for example)
 	poolSize := 5
 	enginePool, err = NewEnginePool(stockfishPath, poolSize)
 	if err != nil {
 		log.Fatalf("Failed to create engine pool: %v", err)
 	}
 
-	// gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 
 	router.Use(cors.Default())
 
 	router.POST("/move", moveHandler)
 
-	// --- Graceful Server Shutdown ---
 	port := "8080"
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -151,7 +141,7 @@ func main() {
 	log.Println("Server exiting")
 }
 
-// moveHandler is updated to correctly parse UCI moves.
+// moveHandler is updated to use UCI_Elo instead of Skill Level.
 func moveHandler(c *gin.Context) {
 	var req MoveRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -160,7 +150,7 @@ func moveHandler(c *gin.Context) {
 	}
 
 	if req.Depth == 0 && req.MoveTime == 0 {
-		req.MoveTime = 1000 // Default to 1 second
+		req.MoveTime = 1000
 	}
 
 	fen, err := chess.FEN(req.CurrentFEN)
@@ -187,8 +177,6 @@ func moveHandler(c *gin.Context) {
 	}
 
 	userMoveStatus := getMoveStatus(game, userMove)
-	log.Printf("User move '%s' was legal. Status: %s", req.UserMove, userMoveStatus)
-
 	if game.Outcome() != chess.NoOutcome {
 		log.Printf("Game over after user move. Outcome: %s", game.Outcome())
 		c.JSON(http.StatusOK, MoveResponse{
@@ -203,25 +191,27 @@ func moveHandler(c *gin.Context) {
 	engine := enginePool.Get()
 	defer enginePool.Put(engine)
 
-	// --- UPDATED LOGIC FOR SKILL LEVEL CONTROL ---
-	// Skill Level is an integer from 0 (weakest) to 20 (strongest).
-	// We'll validate the input and default to 20 (max strength) if out of range.
-	skill := req.SkillLevel
-	if skill < 0 || skill > 20 {
-		skill = 20
-	}
-	log.Printf("Setting engine Skill Level to %d", skill)
+	const minBlunderElo = 400
+	const maxBlunderElo = 2000
+	const maxBlunderChance = 40
 
-	setSkillCmd := uci.CmdSetOption{Name: "Skill Level", Value: strconv.Itoa(skill)}
-	if err := engine.Run(setSkillCmd); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set engine skill level: " + err.Error()})
+	var blunderChance int = 0
+	if req.Elo >= minBlunderElo && req.Elo < maxBlunderElo {
+		progress := float64(req.Elo-minBlunderElo) / float64(maxBlunderElo-minBlunderElo)
+		blunderChance = int((1.0 - progress) * float64(maxBlunderChance))
+	}
+
+	eloCmds := []uci.Cmd{
+		uci.CmdSetOption{Name: "UCI_LimitStrength", Value: "true"},
+		uci.CmdSetOption{Name: "UCI_Elo", Value: "1320"},
+	}
+	if err := engine.Run(eloCmds...); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set engine ELO: " + err.Error()})
 		return
 	}
-	// --- END OF UPDATED LOGIC ---
 
 	cmdPos := uci.CmdPosition{Position: game.Position()}
 	cmdGo := uci.CmdGo{Depth: req.Depth, MoveTime: time.Duration(req.MoveTime) * time.Millisecond}
-
 	if err := engine.Run(cmdPos, cmdGo); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Engine search failed: " + err.Error()})
 		return
@@ -234,8 +224,19 @@ func moveHandler(c *gin.Context) {
 		return
 	}
 
+	randCheck, _ := rand.Int(rand.Reader, big.NewInt(100))
+	if int(randCheck.Int64()) < blunderChance {
+		log.Printf("!!! BLUNDERING !!! Chance was %d%%. Finding a random move.", blunderChance)
+		allMoves := game.ValidMoves()
+		if len(allMoves) > 0 {
+			randIndex, _ := rand.Int(rand.Reader, big.NewInt(int64(len(allMoves))))
+			bestMove = allMoves[randIndex.Int64()]
+		}
+	} else {
+		log.Printf("Not blundering. Chance was %d%%.", blunderChance)
+	}
+
 	if err := game.Move(bestMove); err != nil {
-		log.Printf("FATAL: Engine suggested an illegal move: %s", bestMove.String())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error: Engine suggested illegal move"})
 		return
 	}
@@ -260,13 +261,12 @@ func findMoveByUCI(game *chess.Game, uciMove string) (*chess.Move, error) {
 			return move, nil
 		}
 	}
-	return nil, os.ErrNotExist // Return a clear error if the move isn't found
+	return nil, os.ErrNotExist
 }
 
 // getMoveStatus analyzes the game state *after* a move has been made.
 // It uses the move itself to determine tags like check or capture.
 func getMoveStatus(game *chess.Game, move *chess.Move) string {
-	// Priority 1: Check for game-ending outcomes first.
 	if game.Outcome() != chess.NoOutcome {
 		switch game.Method() {
 		case chess.Checkmate:
@@ -274,21 +274,18 @@ func getMoveStatus(game *chess.Game, move *chess.Move) string {
 		case chess.Stalemate, chess.FivefoldRepetition, chess.FiftyMoveRule, chess.InsufficientMaterial:
 			return "draw"
 		default:
-			return "draw" // Catch-all for other draw types
+			return "draw"
 		}
 	}
 
-	// Priority 2: Check if the move delivered a check.
 	if move.HasTag(chess.Check) {
 		return "check"
 	}
 
-	// Priority 3: Check if the move was a capture.
 	if move.HasTag(chess.Capture) {
 		return "capture"
 	}
 
-	// Otherwise, it was just a legal move.
 	return "legal-move"
 }
 
@@ -306,5 +303,5 @@ func findStockfish() (string, error) {
 			return p, nil
 		}
 	}
-	return "", os.ErrNotExist // Return a standard error
+	return "", os.ErrNotExist
 }
